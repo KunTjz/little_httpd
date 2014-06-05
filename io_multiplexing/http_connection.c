@@ -1,0 +1,283 @@
+#include <unistd.h>
+#include <stdio.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <sys/epoll.h>
+#include <sys/ioctl.h>
+#include <fcntl.h>
+#include <stdlib.h>
+#include <errno.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <map>
+#include <assert.h>
+
+#include "sys_define.h"
+#include "http_connection.h"
+#include "http_request.h"
+#include "http_response.h"
+#include "http_epoll.h"
+#include "http_timer.h"
+
+#define LISTENQ 	20
+#define SERV_PORT	9999 
+#define MAX_CONNECTION 1000
+#define MAX_LINE 4096
+
+extern std::map<int, socket_buf> sb_array;
+
+static void on_timer(int);
+
+static int get_file_size(const char* file)
+{
+	struct stat st;
+	if(stat(file, &st) != 0) {
+		perror("stat fail");
+		return L_HTTP_FAIL;
+	}
+	
+	return st.st_size;
+}
+
+int tcp_listen()
+{
+	int option = 1;
+	struct sockaddr_in serverAddr;
+	int listenfd = socket (AF_INET, SOCK_STREAM, 0);
+	if(listenfd < 0) {
+		perror("socket failed: ");
+		return L_HTTP_FAIL;
+	}
+	
+	if(set_nonblocking(listenfd) == L_HTTP_FAIL)
+		return L_HTTP_FAIL;	
+
+	bzero(&serverAddr, sizeof(serverAddr));
+	serverAddr.sin_family = AF_INET;
+	serverAddr.sin_addr.s_addr = htonl(INADDR_ANY);
+	serverAddr.sin_port = htons(SERV_PORT);
+
+	if(setsockopt(listenfd, SOL_SOCKET, SO_REUSEADDR, &option, sizeof(option)) < 0) {
+		perror("set SO_REUSEADDR fail");
+		return L_HTTP_FAIL;
+	}
+
+	if (bind(listenfd, (struct sockaddr*) &serverAddr, sizeof (serverAddr)) < 0) {
+		perror("bind failed: ");
+		return L_HTTP_FAIL;
+	}
+
+	if(listen(listenfd, LISTENQ) < 0) {
+		perror("listen failed: ");
+		return L_HTTP_FAIL;
+	}
+
+	return listenfd;
+}
+
+int handle_connection(socket_buf sb)
+{
+	int size;
+	http_request rst;
+	char response_head[] = "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\n";
+	char response_fail[] = "HTTP/1.1 404 not found\r\nContent-Type: text/html\r\n\r\n<html><body>request not found</body></html>";
+
+	if(http_request_parse(sb->read_buf, &rst) == L_HTTP_FAIL)
+		return L_HTTP_FAIL;
+
+	sb->rb_size = 0;
+	printf("file:%s\n", rst.file);
+	
+	if((size = get_file_size(rst.file)) == L_HTTP_FAIL) {
+		strcpy(sb->write_buf, response_fail);
+		sb->wb_size = strlen(response_fail);
+		return L_HTTP_SUCCESS;
+	}
+
+	size += strlen(response_head);
+	if(size < strlen(response_head))
+		return L_HTTP_FAIL;
+	if(socket_write_buf_alloc(sb, size) == L_HTTP_FAIL)
+		return L_HTTP_FAIL;	
+
+	strncpy(sb->write_buf, response_head, strlen(response_head));
+	generate_response(sb->write_buf + strlen(sb->write_buf), rst.file);
+
+	sb->wb_size = size;
+	return L_HTTP_SUCCESS;
+}
+
+void loop()
+{
+	int listenfd = tcp_listen();
+	int epoll_fd = epoll_init();
+
+	if(listenfd < 0 || epoll_fd < 0)
+		exit(1);
+	
+	if(epoll_add_event(epoll_fd, EPOLLIN, listenfd) == L_HTTP_FAIL) {
+		printf("add listenfd fail\n");
+		return;
+	}
+	while (1) {
+		if(epoll_start(epoll_fd, MAX_CONNECTION, listenfd) < 0)
+			break;
+	
+		on_timer(epoll_fd);
+	}
+
+	close(listenfd);
+}
+
+int on_accept(int epoll_fd, int listen_sock)
+{
+	int conn_sock;
+	socket_buf sb;
+	struct sockaddr_in client_addr;
+	socklen_t client_len = 0;
+	struct epoll_event ev;
+
+	memset(&client_addr, 0, sizeof(struct sockaddr_in));
+
+	while(1) {
+		if ((conn_sock = accept(listen_sock, (struct sockaddr*) &client_addr, &client_len)) < 0) {
+			if (errno == EINTR)
+				continue;		
+			else {
+				perror("accept failed: ");
+				return L_HTTP_FAIL;
+			}
+		}
+		break;
+	}
+
+	set_nonblocking(conn_sock);
+	sb = generate_socket_buf(conn_sock);
+	if(sb == NULL) {
+		perror("not enough memory");
+		return L_HTTP_FAIL;
+	}			
+
+	sb->state = STATE_HTTP_READ;
+	if(sb_array.size() < MAX_CONNECTION 
+			&& find_socket_buf(conn_sock) == NULL)
+		sb_array[conn_sock] = sb;
+	else {
+		printf("to many connections or using same fd");
+		return L_HTTP_FAIL;
+	}
+
+	ev.events = EPOLLIN;
+	set_timer(sb->timer, DEFAULT_TIME_LENGTH);	
+
+	return epoll_add_event(epoll_fd, EPOLLIN, conn_sock);
+}
+
+int on_read(int epoll_fd, int sockfd)
+{
+	int total, len;
+	socket_buf sb;
+	sb = find_socket_buf(sockfd);
+	assert(sb != NULL);
+
+	if(ioctl(sockfd, FIONREAD, &total) < 0) {
+		printf("ioctl fail");
+		return L_HTTP_FAIL;
+	}
+	
+	if(socket_read_buf_alloc(sb, total) == L_HTTP_FAIL)
+		return L_HTTP_FAIL;	
+
+	while(total > 0) {
+		if((len = read(sockfd, sb->read_buf, (total > MAX_LINE)? MAX_LINE : total)) < 0) {
+			if(errno == EINTR) {
+				continue;
+			} 
+			else {
+				perror("read fail");
+				return L_HTTP_FAIL;
+			}
+		} 
+		else if(len == 0) {
+			return L_HTTP_FAIL;
+		}
+	
+		total -= len;
+		sb->rb_size += len;
+	}
+	
+	printf("read_buf:%s\n", sb->read_buf);
+
+	sb->state = STATE_HTTP_WRITE;			
+	if(handle_connection(sb) == L_HTTP_FAIL) {
+		return L_HTTP_FAIL;
+	}
+	
+	update_timer(sb->timer);
+
+	return epoll_modify_mod(epoll_fd, EPOLLOUT, sockfd);
+}
+
+int on_write(int epoll_fd, int sockfd)
+{
+	char* str;
+	socket_buf sb;
+	int total_to_write, len;
+
+	sb = find_socket_buf(sockfd);
+	assert(sb != NULL);
+
+	total_to_write = sb->wb_size;
+	str = sb->write_buf;
+	while(total_to_write > 0){
+		if ((len = write(sockfd, str, 
+						(total_to_write >= MAX_LINE) ? MAX_LINE : total_to_write)) < 0) {
+			if(errno == EINTR)
+				continue;
+			else {
+				perror("write failed:");
+				return L_HTTP_FAIL;
+			}
+		}
+		else if(len == 0) {
+			return L_HTTP_FAIL;
+		}
+
+		str += len;
+		total_to_write -= len;
+	}
+
+	sb->wb_size = 0;
+	update_timer(sb->timer);
+	
+	return epoll_modify_mod(epoll_fd, EPOLLIN, sockfd);
+}
+
+int on_close(int epoll_fd, int fd)
+{
+	std::map<int, socket_buf>::iterator it = sb_array.begin();
+	epoll_del_event(epoll_fd, fd);
+	
+	printf("debug: start free %d\n", fd);
+	if((it = sb_array.find(fd)) != sb_array.end())
+		sb_array.erase(sb_array.find(fd));
+	free_socket_buf(fd);
+	
+	close(fd);
+
+	return L_HTTP_SUCCESS;
+}
+
+static void on_timer(int epoll_fd)
+{
+	// 这次每次都调用is_time_out，会有多次time系统调用，需改进
+	std::map<int, socket_buf>::iterator it = sb_array.begin();
+	for(; it != sb_array.end(); it++) {
+		if(is_time_out(it->second->timer) == HTTP_TIME_OUT){
+			printf("connect:%d time out\n", it->first);
+			on_close(epoll_fd, it->first);
+		}
+	}
+}
